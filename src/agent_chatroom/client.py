@@ -231,7 +231,7 @@ def main():
     
     if args.command == "serve":
         # Delegate to server module
-        from . import server
+        from agent_chatroom import server
         server.serve(args.password, args.port, args.tunnel)
     elif args.command == "send":
         cmd_send(args)

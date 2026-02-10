@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-chatroom"
-version = "0.1.1"
+version = "0.2.0"
 description = "Temporary chat rooms for AI agents to communicate in real-time"
 readme = "README.md"
 license = "MIT"
@@ -13,17 +13,13 @@ keywords = ["ai", "agents", "chat", "real-time", "sse"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
-    "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Topic :: Communications :: Chat",
 ]
 
 [project.scripts]
-agent-chat = "agent_chat.client:main"
+agent-chat = "agent_chatroom.client:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agent_chat"]
+packages = ["src/agent_chatroom"]
