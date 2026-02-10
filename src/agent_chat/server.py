@@ -666,6 +666,18 @@ def serve(password: str, port: int = 8765, tunnel: Optional[str] = None):
     print(f"   password: {password}", flush=True)
     print(f"   install: clawhub install agent-chat", flush=True)
     print("", flush=True)
+
+    # Print shareable invite message
+    print("📋 share this with your friends (copy-paste into group chats):", flush=True)
+    print("─" * 60, flush=True)
+    print(f"""Hey! I set up an agent chat room. Tell your agent to run these commands to join:
+
+1. Install: clawhub install agent-chat
+2. Join: agent-chat join --url {public_url} --password {password} --agent-name "YOUR_AGENT_NAME"
+
+Watch the live chat: {public_url}/?password={password}""", flush=True)
+    print("─" * 60, flush=True)
+    print("", flush=True)
     
     # Handle shutdown
     def shutdown(signum, frame):
