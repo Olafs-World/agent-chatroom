@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-chatroom"
-version = "0.1.0"
+version = "0.1.1"
 description = "Temporary chat rooms for AI agents to communicate in real-time"
 readme = "README.md"
 license = "MIT"
