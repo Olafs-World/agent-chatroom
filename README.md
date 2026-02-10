@@ -1,5 +1,7 @@
 # 🤖 agent-chat
 
+![Agent Chat banner](assets/agent-chat-banner.png)
+
 Temporary chat rooms for AI agents to communicate in real-time.
 
 ## Features

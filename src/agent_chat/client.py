@@ -120,26 +120,35 @@ def listen_sse(url: str, password: str, callback):
         print(f"❌ SSE error: {e}", file=sys.stderr, flush=True)
 
 
-def listen_polling(url: str, password: str, callback, poll_interval: float = 1.0):
-    """Listen for messages via polling."""
-    seen = set()
+def listen_poll(url: str, password: str, callback):
+    """Listen for messages via polling (works through all proxies)."""
+    api_url = url.rstrip('/') + '/messages/poll'
+    next_idx = 0
+    interval = 0.5  # seconds
     
     while True:
         try:
-            messages = get_messages(url, password)
-            for msg in messages:
-                # Create unique ID for deduplication
-                msg_id = f"{msg.get('agent')}:{msg.get('timestamp')}:{msg.get('text')}"
-                if msg_id not in seen:
-                    seen.add(msg_id)
-                    callback(msg)
+            poll_url = f"{api_url}?password={urllib.parse.quote(password)}&after={next_idx}"
+            req = urllib.request.Request(poll_url, method='GET')
             
-            time.sleep(poll_interval)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read())
+                next_idx = result.get('next', next_idx)
+                msgs = result.get('messages', [])
+                for msg in msgs:
+                    callback(msg)
+                
+                if msgs:
+                    interval = 0.5  # got messages, poll fast
+                else:
+                    interval = min(interval + 0.2, 3.0)  # slow down when idle
+            
+            time.sleep(interval)
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print(f"❌ Polling error: {e}", file=sys.stderr, flush=True)
-            time.sleep(poll_interval)
+            print(f"❌ Poll error: {e}", file=sys.stderr, flush=True)
+            time.sleep(3)
 
 
 def cmd_send(args):
@@ -157,17 +166,20 @@ def cmd_listen(args):
     def on_message(msg):
         print(format_message(msg), flush=True)
     
-    # Try SSE first, fall back to polling
-    try:
-        listen_sse(args.url, args.password, on_message)
-    except Exception:
-        print("⚠️  SSE not available, falling back to polling", file=sys.stderr, flush=True)
-        listen_polling(args.url, args.password, on_message)
+    listen_poll(args.url, args.password, on_message)
 
 
 def cmd_join(args):
     """Handle join command - announce presence and listen."""
     print(f"🤖 Joining as {args.agent_name}...", file=sys.stderr, flush=True)
+    
+    # Get existing messages first (so we know the index before join msg)
+    existing = get_messages(args.url, args.password)
+    for msg in existing:
+        print(format_message(msg), flush=True)
+    
+    if existing:
+        print("--- end of history ---", flush=True)
     
     # Send join message
     send_message(args.url, args.password, args.agent_name, f"*joined the chat*")
@@ -175,19 +187,8 @@ def cmd_join(args):
     def on_message(msg):
         print(format_message(msg), flush=True)
     
-    # First print existing messages
-    messages = get_messages(args.url, args.password)
-    for msg in messages:
-        print(format_message(msg), flush=True)
-    
-    if messages:
-        print("--- end of history ---", flush=True)
-    
-    # Then listen for new ones
-    try:
-        listen_sse(args.url, args.password, on_message)
-    except Exception:
-        listen_polling(args.url, args.password, on_message)
+    # Listen from after existing messages (join msg + future will come through)
+    listen_poll(args.url, args.password, on_message)
 
 
 def main():

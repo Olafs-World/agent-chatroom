@@ -26,7 +26,8 @@ room_password: str = ""
 connected_agents: set[str] = set()
 agents_lock = threading.Lock()
 
-# SSE clients
+# SSE clients — each client gets a queue
+import queue
 sse_clients: list = []
 sse_lock = threading.Lock()
 
@@ -215,26 +216,66 @@ WEB_UI_HTML = '''<!DOCTYPE html>
         </div>
     </div>
     
-    <div class="chat-input" id="chat-input">
-        <input type="text" id="name-input" placeholder="your name" maxlength="30" style="
-            flex: 0 0 120px; padding: 0.6rem 0.8rem; background: #1a1f2b; border: 1px solid #2d3548;
-            border-radius: 8px; color: #e6edf3; font-size: 0.85rem; outline: none;
-        ">
-        <input type="text" id="msg-input" placeholder="type a message..." autofocus style="
+    <!-- Name entry overlay -->
+    <div class="name-overlay" id="name-overlay">
+        <div class="name-card">
+            <div class="name-card-emoji">💬</div>
+            <div class="name-card-title">join the chat</div>
+            <input type="text" id="name-input" placeholder="enter your name" maxlength="30" autofocus>
+            <button id="name-btn" onclick="setName()">join</button>
+        </div>
+    </div>
+
+    <!-- Chat input (hidden until name is set) -->
+    <div class="chat-input" id="chat-input" style="display:none;">
+        <span class="chat-name" id="chat-name" onclick="changeName()" title="click to change name"></span>
+        <input type="text" id="msg-input" placeholder="type a message...">
+        <button id="send-btn" onclick="sendMessage()">send</button>
+    </div>
+
+    <style>
+        .name-overlay {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(13, 17, 23, 0.9); display: flex;
+            align-items: center; justify-content: center; z-index: 100;
+            backdrop-filter: blur(4px);
+        }
+        .name-card {
+            background: #161b22; border: 1px solid #2d3548; border-radius: 16px;
+            padding: 2rem; text-align: center; max-width: 320px; width: 90%;
+        }
+        .name-card-emoji { font-size: 2.5rem; margin-bottom: 0.5rem; }
+        .name-card-title { font-size: 1.1rem; font-weight: 600; color: #e6edf3; margin-bottom: 1.25rem; }
+        .name-card input {
+            width: 100%; padding: 0.7rem 1rem; background: #0d1117; border: 1px solid #2d3548;
+            border-radius: 8px; color: #e6edf3; font-size: 1rem; outline: none;
+            text-align: center; margin-bottom: 0.75rem;
+        }
+        .name-card input:focus { border-color: #58a6ff; }
+        .name-card button {
+            width: 100%; padding: 0.7rem; background: #58a6ff; color: #0d1117; border: none;
+            border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 0.95rem;
+        }
+        .name-card button:hover { background: #79c0ff; }
+        .chat-input {
+            display: flex; gap: 0.5rem; padding: 0.6rem 1rem;
+            border-top: 1px solid #1e2433; background: #0d1117; align-items: center;
+        }
+        .chat-input input {
             flex: 1; padding: 0.6rem 0.8rem; background: #1a1f2b; border: 1px solid #2d3548;
             border-radius: 8px; color: #e6edf3; font-size: 0.85rem; outline: none;
-        ">
-        <button id="send-btn" onclick="sendMessage()" style="
-            padding: 0.6rem 1.2rem; background: #58a6ff; color: #0d1117; border: none;
-            border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 0.85rem;
-        ">send</button>
-    </div>
-    <style>
-        .chat-input {
-            display: flex; gap: 0.5rem; padding: 0.75rem 1rem;
-            border-top: 1px solid #1e2433; background: #0d1117;
         }
         .chat-input input:focus { border-color: #58a6ff; }
+        .chat-name {
+            font-size: 0.75rem; color: #58a6ff; font-weight: 600; cursor: pointer;
+            white-space: nowrap; padding: 0.3rem 0.6rem; background: rgba(88,166,255,0.1);
+            border-radius: 6px;
+        }
+        .chat-name:hover { background: rgba(88,166,255,0.2); }
+        #send-btn {
+            padding: 0.6rem 1.2rem; background: #58a6ff; color: #0d1117; border: none;
+            border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 0.85rem;
+        }
         #send-btn:hover { background: #79c0ff; }
     </style>
 
@@ -260,7 +301,17 @@ WEB_UI_HTML = '''<!DOCTYPE html>
             return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         }
         
+        const renderedKeys = new Set();
+        
+        function msgKey(msg) {
+            return msg.agent + '|' + msg.text + '|' + (msg.timestamp || '').slice(0, 19);
+        }
+        
         function addMessage(msg) {
+            const key = msgKey(msg);
+            if (renderedKeys.has(key)) return; // dedup
+            renderedKeys.add(key);
+            
             if (emptyState) {
                 emptyState.remove();
             }
@@ -296,48 +347,85 @@ WEB_UI_HTML = '''<!DOCTYPE html>
         const urlParams = new URLSearchParams(window.location.search);
         const password = urlParams.get('password') || '';
         
-        // Connect to SSE stream
-        function connect() {
-            const evtSource = new EventSource('/messages/stream?password=' + encodeURIComponent(password));
-            
-            evtSource.onmessage = function(event) {
-                if (event.data === ':keepalive') return;
-                try {
-                    const msg = JSON.parse(event.data);
-                    addMessage(msg);
-                } catch (e) {
-                    console.error('Failed to parse message:', e);
+        // Long-poll for new messages (works through cloudflared/proxies)
+        let pollNext = 0;
+        let polling = false;
+        
+        let pollInterval = 500; // ms between polls
+        
+        async function poll() {
+            if (polling) return;
+            polling = true;
+            try {
+                const resp = await fetch('/messages/poll?password=' + encodeURIComponent(password) + '&after=' + pollNext);
+                if (!resp.ok) { polling = false; setTimeout(poll, 3000); return; }
+                const data = await resp.json();
+                pollNext = data.next;
+                if (data.messages && data.messages.length > 0) {
+                    data.messages.forEach(addMessage);
+                    pollInterval = 500; // got messages → poll fast
+                } else {
+                    pollInterval = Math.min(pollInterval + 200, 3000); // slow down when idle
                 }
-            };
-            
-            evtSource.onerror = function() {
-                console.log('SSE connection lost, reconnecting...');
-                evtSource.close();
-                setTimeout(connect, 2000);
-            };
+            } catch (e) {
+                console.error('Poll error:', e);
+                pollInterval = 3000;
+            }
+            polling = false;
+            setTimeout(poll, pollInterval);
         }
         
-        // Send message from UI
+        // Name + messaging
+        const nameOverlay = document.getElementById('name-overlay');
         const nameInput = document.getElementById('name-input');
+        const chatInput = document.getElementById('chat-input');
+        const chatName = document.getElementById('chat-name');
         const msgInput = document.getElementById('msg-input');
+        let userName = localStorage.getItem('agent-chat-name') || '';
 
-        // Remember name in localStorage
-        const savedName = localStorage.getItem('agent-chat-name');
-        if (savedName) nameInput.value = savedName;
+        // If we already have a name, skip the overlay
+        if (userName) {
+            nameOverlay.style.display = 'none';
+            chatInput.style.display = 'flex';
+            chatName.textContent = userName;
+        }
+
+        function setName() {
+            const name = nameInput.value.trim();
+            if (!name) return;
+            userName = name;
+            localStorage.setItem('agent-chat-name', name);
+            nameOverlay.style.display = 'none';
+            chatInput.style.display = 'flex';
+            chatName.textContent = name;
+            msgInput.focus();
+        }
+
+        function changeName() {
+            const newName = prompt('change your name:', userName);
+            if (newName && newName.trim()) {
+                userName = newName.trim();
+                localStorage.setItem('agent-chat-name', userName);
+                chatName.textContent = userName;
+            }
+        }
+
+        nameInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') { e.preventDefault(); setName(); }
+        });
 
         function sendMessage() {
-            const name = nameInput.value.trim();
             const text = msgInput.value.trim();
-            if (!name || !text) return;
+            if (!userName || !text) return;
 
-            localStorage.setItem('agent-chat-name', name);
+            const msg = { agent: userName, text: text, timestamp: new Date().toISOString() };
+            msgInput.value = '';
+            addMessage(msg);  // optimistic render
 
             fetch('/messages?password=' + encodeURIComponent(password), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ agent: name, text: text })
-            }).then(r => {
-                if (r.ok) { msgInput.value = ''; }
+                body: JSON.stringify({ agent: userName, text: text })
             }).catch(e => console.error('Send failed:', e));
         }
 
@@ -348,18 +436,19 @@ WEB_UI_HTML = '''<!DOCTYPE html>
             }
         });
 
-        // Load existing messages first
+        // Load existing messages then start long-polling
         fetch('/messages?password=' + encodeURIComponent(password))
             .then(r => r.json())
             .then(data => {
                 if (data.messages) {
                     data.messages.forEach(addMessage);
+                    pollNext = data.messages.length;
                 }
-                connect();
+                poll();
             })
             .catch(e => {
                 console.error('Failed to load messages:', e);
-                connect();
+                poll();
             });
     </script>
 </body>
@@ -378,18 +467,13 @@ def check_password(provided: str, expected: str) -> bool:
 
 
 def broadcast_message(msg: dict):
-    """Send message to all SSE clients."""
-    data = f"data: {json.dumps(msg)}\n\n"
+    """Send message to all SSE clients via their queues."""
     with sse_lock:
-        dead_clients = []
-        for client in sse_clients:
+        for client_queue in sse_clients:
             try:
-                client['wfile'].write(data.encode())
-                client['wfile'].flush()
+                client_queue.put_nowait(msg)
             except Exception:
-                dead_clients.append(client)
-        for client in dead_clients:
-            sse_clients.remove(client)
+                pass
 
 
 class ChatHandler(BaseHTTPRequestHandler):
@@ -467,34 +551,67 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             
         elif path == '/messages/stream':
-            # SSE stream
+            # SSE stream (works on direct connections, may not work through proxies)
             if not self.check_auth():
                 return
             
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
-            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Cache-Control', 'no-cache, no-transform')
             self.send_header('Connection', 'keep-alive')
+            self.send_header('X-Accel-Buffering', 'no')
             self.send_cors_headers()
             self.end_headers()
+            self.wfile.flush()
             
-            # Add to SSE clients
-            client = {'wfile': self.wfile}
+            # Add a queue for this client
+            q = queue.Queue()
             with sse_lock:
-                sse_clients.append(client)
+                sse_clients.append(q)
             
-            # Keep connection alive
             try:
+                self.wfile.write(b": connected\n\n")
+                self.wfile.flush()
+                
                 while True:
-                    time.sleep(15)
-                    self.wfile.write(b":keepalive\n\n")
-                    self.wfile.flush()
+                    try:
+                        msg = q.get(timeout=15)
+                        data = f"data: {json.dumps(msg)}\n\n"
+                        self.wfile.write(data.encode())
+                        self.wfile.flush()
+                    except queue.Empty:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
             except Exception:
                 pass
             finally:
                 with sse_lock:
-                    if client in sse_clients:
-                        sse_clients.remove(client)
+                    if q in sse_clients:
+                        sse_clients.remove(q)
+        
+        elif path == '/messages/poll':
+            # Poll endpoint: returns new messages since `after` index
+            # Non-blocking — client re-polls with backoff
+            if not self.check_auth():
+                return
+            
+            params = parse_qs(parsed.query)
+            after = int(params.get('after', ['0'])[0])
+            
+            with messages_lock:
+                if len(messages) > after:
+                    new_msgs = messages[after:]
+                    data = {'messages': new_msgs, 'next': len(messages)}
+                else:
+                    data = {'messages': [], 'next': len(messages)}
+            
+            content = json.dumps(data).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(content)))
+            self.send_cors_headers()
+            self.end_headers()
+            self.wfile.write(content)
         
         elif path == '/health':
             # Health check (no auth required)
@@ -585,6 +702,8 @@ class ChatHandler(BaseHTTPRequestHandler):
 class ThreadedHTTPServer(HTTPServer):
     """HTTP server that handles each request in a new thread."""
     
+    allow_reuse_address = True
+    
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.daemon_threads = True
@@ -652,42 +771,78 @@ def download_cloudflared() -> str:
     return dest
 
 
-def start_tunnel(port: int, cloudflared_path: str) -> tuple[subprocess.Popen, str]:
-    """Start cloudflared tunnel and return (process, public_url)."""
-    cmd = [cloudflared_path, "tunnel", "--url", f"http://localhost:{port}"]
+def _drain_pipe(pipe):
+    """Read and discard pipe output to prevent buffer deadlock."""
+    try:
+        for _ in pipe:
+            pass
+    except Exception:
+        pass
+
+
+def start_tunnel(port: int, cloudflared_path: str) -> tuple[int, str]:
+    """Start cloudflared tunnel and return (pid, public_url).
     
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
+    Uses double-fork daemonization so cloudflared is fully detached from the
+    Python process tree — no shared pipes, no signal inheritance.
+    """
+    import re
+    import tempfile
     
-    # Parse URL from stderr
+    log_file = tempfile.mktemp(suffix='.log', prefix='cf-')
+    
+    # Double-fork to fully daemonize cloudflared
+    first_pid = os.fork()
+    if first_pid == 0:
+        # First child — become session leader
+        os.setsid()
+        second_pid = os.fork()
+        if second_pid == 0:
+            # Second child (grandchild) — this becomes cloudflared
+            # Redirect stdout/stderr
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            log_fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            os.dup2(devnull, 1)  # stdout → /dev/null
+            os.dup2(log_fd, 2)  # stderr → log file
+            os.close(devnull)
+            os.close(log_fd)
+            
+            os.execvp(cloudflared_path, [
+                cloudflared_path, "tunnel",
+                "--url", f"http://localhost:{port}",
+                "--protocol", "http2",
+                "--no-autoupdate",
+            ])
+        else:
+            # First child exits immediately — grandchild reparented to init
+            os._exit(0)
+    else:
+        # Parent — wait for first child to exit
+        os.waitpid(first_pid, 0)
+    
+    # Wait for tunnel URL to appear in log
     public_url = None
     deadline = time.time() + 30
     
     while time.time() < deadline:
-        line = proc.stderr.readline()
-        if not line:
-            if proc.poll() is not None:
-                break
-            time.sleep(0.1)
-            continue
-        
-        # Look for trycloudflare URL
-        if "trycloudflare.com" in line:
-            import re
-            match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
+        time.sleep(1)
+        try:
+            with open(log_file, 'r') as f:
+                content = f.read()
+            match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', content)
             if match:
                 public_url = match.group(0)
-                break
+                # Find the PID of cloudflared
+                result = subprocess.run(
+                    ['pgrep', '-f', f'cloudflared.*tunnel.*{port}'],
+                    capture_output=True, text=True
+                )
+                cf_pid = int(result.stdout.strip().split('\n')[0])
+                return cf_pid, public_url
+        except (FileNotFoundError, ValueError):
+            pass
     
-    if not public_url:
-        proc.terminate()
-        raise RuntimeError("Failed to get tunnel URL from cloudflared")
-    
-    return proc, public_url
+    raise RuntimeError("Failed to get tunnel URL from cloudflared")
 
 
 def serve(password: str, port: int = 8765, tunnel: Optional[str] = None):
@@ -698,7 +853,7 @@ def serve(password: str, port: int = 8765, tunnel: Optional[str] = None):
     # Start HTTP server
     server = ThreadedHTTPServer(('0.0.0.0', port), ChatHandler)
     
-    tunnel_proc = None
+    tunnel_pid = None
     public_url = f"http://localhost:{port}"
     
     if tunnel == "cloudflared":
@@ -706,7 +861,7 @@ def serve(password: str, port: int = 8765, tunnel: Optional[str] = None):
         if not cf_path:
             cf_path = download_cloudflared()
         
-        tunnel_proc, public_url = start_tunnel(port, cf_path)
+        tunnel_pid, public_url = start_tunnel(port, cf_path)
     
     # Print startup info
     print("", flush=True)
@@ -732,8 +887,11 @@ Watch the live chat: {public_url}/?password={password}""", flush=True)
     # Handle shutdown
     def shutdown(signum, frame):
         print("\n👋 Shutting down...", flush=True)
-        if tunnel_proc:
-            tunnel_proc.terminate()
+        if tunnel_pid:
+            try:
+                os.kill(tunnel_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         server.shutdown()
         sys.exit(0)
     
