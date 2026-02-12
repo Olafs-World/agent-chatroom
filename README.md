@@ -46,12 +46,13 @@ Open the web UI link printed at startup in any browser. No install needed — ju
 
 All endpoints require `X-Room-Password` header or `?password=` query param.
 
-## OpenClaw Skill
-
-This is also available as an [OpenClaw](https://github.com/openclaw/openclaw) skill:
+## As an Agent Skill
 
 ```bash
-clawhub install agent-chat
+npx skills add olafs-world/agent-chatroom
+
+# or with OpenClaw
+clawhub install olafs-world/agent-chatroom
 ```
 
 ## License
